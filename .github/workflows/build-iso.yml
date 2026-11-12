@@ -1,0 +1,71 @@
+name: Build Cove ISO
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Check Windows download link
+        shell: pwsh
+        env:
+          COVE_BASE_ISO_URL: ${{ secrets.COVE_BASE_ISO_URL }}
+        run: |
+          $uri = $null
+          if (![Uri]::TryCreate($env:COVE_BASE_ISO_URL, [UriKind]::Absolute, [ref]$uri) -or
+              $uri.Scheme -ne 'https' -or !$uri.Host.EndsWith('.microsoft.com', [StringComparison]::OrdinalIgnoreCase) -or
+              !$uri.AbsolutePath.EndsWith('.iso', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Set the COVE_BASE_ISO_URL Actions secret to the direct Microsoft Windows 11 x64 ISO download link.'
+          }
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Package Cove
+        shell: pwsh
+        run: |
+          python -m pip install --no-cache-dir -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+          ./scripts/Build-App.ps1
+      - name: Install ADK Deployment Tools
+        shell: pwsh
+        run: |
+          $adk = Join-Path $env:RUNNER_TEMP 'cove-adk'
+          $installer = Join-Path $env:RUNNER_TEMP 'adksetup.exe'
+          Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2289980' -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList @(
+            '/quiet', '/norestart', '/installpath', ('"' + $adk + '"'),
+            '/features', 'OptionId.DeploymentTools'
+          ) -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Windows ADK installation failed with exit code $($process.ExitCode)."
+          }
+          $oscdimg = Get-ChildItem -LiteralPath $adk -Filter 'oscdimg.exe' -Recurse -File |
+            Where-Object FullName -like '*\amd64\Oscdimg\oscdimg.exe' | Select-Object -First 1
+          if (!$oscdimg) { throw 'Oscdimg was not installed.' }
+          "COVE_OSCDIMG=$($oscdimg.FullName)" >> $env:GITHUB_ENV
+      - name: Download Windows 11 and build ISO
+        shell: pwsh
+        env:
+          COVE_BASE_ISO_URL: ${{ secrets.COVE_BASE_ISO_URL }}
+        run: |
+          $base = Join-Path $env:RUNNER_TEMP 'cove-windows-base.iso'
+          curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 2 --output $base $env:COVE_BASE_ISO_URL
+          if ($LASTEXITCODE -ne 0) { throw 'Windows ISO download failed. Check the Microsoft download link and refresh it if it expired.' }
+          $destination = Join-Path $env:RUNNER_TEMP 'Cove-Windows11-x64.iso'
+          ./scripts/Build-Iso.ps1 -BaseIso $base -OutputIso $destination -Oscdimg $env:COVE_OSCDIMG -ConsumeRunnerDownload
+      - name: Upload downloadable ISO
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/Cove-Windows11-x64.iso
+          if-no-files-found: error
+          archive: false
+          overwrite: true
+          retention-days: 3
